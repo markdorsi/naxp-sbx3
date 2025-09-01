@@ -1,0 +1,36 @@
+name: preview-link
+on:
+  deployment_status:
+    types: [created, success]
+permissions:
+  pull-requests: write
+jobs:
+  attach:
+    runs-on: ubuntu-latest
+    if: github.event.deployment_status.state == 'success' && contains(github.event.deployment.environment, 'Deploy Preview')
+    steps:
+      - name: Find PR from deployment ref
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {context, github} = require("@actions/github");
+            const ref = context.payload.deployment.ref;
+            const {owner, repo} = context.repo;
+            const prs = await github.rest.pulls.list({owner, repo, head: `${owner}:${ref}`, state: "open"});
+            if (!prs.data.length) { core.setFailed("No open PR for this ref"); return; }
+            core.setOutput("number", prs.data[0].number);
+      - name: Patch PR body or comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PREVIEW_URL: ${{ github.event.deployment_status.target_url }}
+        run: |
+          body=$(gh pr view "$PR_NUMBER" --json body -q .body)
+          new=$(printf "%s" "$body" | sed "s|(link will auto-insert after Netlify build)|$PREVIEW_URL|")
+          if [ "$new" != "$body" ]; then
+            printf "%s" "$new" > pr_body.md
+            gh pr edit "$PR_NUMBER" --body-file pr_body.md
+          else
+            gh pr comment "$PR_NUMBER" --body "Preview: $PREVIEW_URL"
+          fi
