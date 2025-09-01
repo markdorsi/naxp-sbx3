@@ -1,0 +1,80 @@
+name: pr-autodescribe
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  describe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get PR metadata
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {context, github} = require("@actions/github");
+            const {owner, repo, number} = context.issue;
+            const pr = await github.rest.pulls.get({owner, repo, pull_number: number});
+            core.setOutput("base", pr.data.base.sha);
+            core.setOutput("head", pr.data.head.sha);
+            core.setOutput("title", pr.data.title || "");
+            core.setOutput("number", number.toString());
+      - name: Fetch unified diff
+        id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/${{ github.repository }}/compare/${{ steps.pr.outputs.base }}...${{ steps.pr.outputs.head }} -H "Accept: application/vnd.github.v3.diff" > pr.diff
+          echo "path=pr.diff" >> $GITHUB_OUTPUT
+      - name: Generate PR body with Claude
+        id: body
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          node -e '
+          const fs = require("fs");
+          const diff = fs.readFileSync("pr.diff","utf8").slice(0, 180000);
+          const prompt = `You are preparing a high-quality PR description from this git diff. Output ONLY a GitHub Markdown body with strict sections.`;
+          (async () => {
+            const fetch = (await import("node-fetch")).default;
+            const resp = await fetch("https://api.anthropic.com/v1/messages", {
+              method: "POST",
+              headers: {
+                "x-api-key": process.env.ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+              },
+              body: JSON.stringify({
+                model: "claude-3.5-sonnet-latest",
+                max_tokens: 1200,
+                messages: [
+                  {role:"system", content:"Be concise. Use bullets. No prefaces."},
+                  {role:"user", content: [{type:"text", text: prompt + "\n\nDIFF:\n````diff\n" + diff + "\n````"}]}
+                ]
+              })
+            });
+            const data = await resp.json();
+            const text = data?.content?.[0]?.text || "## What\n-";
+            fs.writeFileSync("pr_body.md", text);
+          })().catch(e => { console.error(e); process.exit(1); });
+          '
+      - name: Update PR title/body
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE_LINE=$(grep -n '^## Title' pr_body.md | cut -d: -f1 | head -n1 || true)
+          if [ -n "$TITLE_LINE" ]; then
+            NEXT=$((TITLE_LINE+1))
+            NEWTITLE=$(sed -n "${NEXT}p" pr_body.md | sed "s/^ *//")
+            if [ -n "$NEWTITLE" ]; then
+              gh pr edit ${{ steps.pr.outputs.number }} --title "$NEWTITLE" || true
+            fi
+          fi
+          gh pr edit ${{ steps.pr.outputs.number }} --body-file pr_body.md
+      - name: Exec summary comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "🤖 Claude auto-generated PR description." | gh pr comment ${{ steps.pr.outputs.number }} --body-file -
